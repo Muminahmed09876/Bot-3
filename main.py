@@ -50,8 +50,8 @@ USER_THUMB_TIME = {}
 
 # --- STATE FOR AUDIO CHANGE ---
 MKV_AUDIO_CHANGE_MODE = set()
-# Stores the path of the downloaded file waiting for audio order
-AUDIO_CHANGE_FILE = {} 
+# Stores multiple files waiting for audio order, keyed by the audio list prompt message ID
+PENDING_AUDIO_ORDERS = {} # {prompt_message_id: {'uid': int, 'path': str, 'original_name': str, 'tracks': list}} 
 # ------------------------------
 
 # --- NEW STATE FOR POST CREATION ---
@@ -147,7 +147,8 @@ def mode_check_keyboard(uid: int) -> InlineKeyboardMarkup:
     caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
     
     # Check if a file is waiting for track order input
-    waiting_status = " (অর্ডার বাকি)" if uid in AUDIO_CHANGE_FILE else ""
+    waiting_count = sum(1 for data in PENDING_AUDIO_ORDERS.values() if data['uid'] == uid)
+    waiting_status = f" ({waiting_count}টি অর্ডার বাকি)" if waiting_count > 0 else ""
     
     keyboard = [
         [InlineKeyboardButton(f"MKV Audio Change Mode {audio_status}{waiting_status}", callback_data="toggle_audio_mode")],
@@ -606,15 +607,10 @@ async def toggle_audio_change_mode(c, m: Message):
 
     if uid in MKV_AUDIO_CHANGE_MODE:
         MKV_AUDIO_CHANGE_MODE.discard(uid)
-        # Clean up any pending file path
-        if uid in AUDIO_CHANGE_FILE:
-            try:
-                Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
-                if 'message_id' in AUDIO_CHANGE_FILE[uid]:
-                    await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
-            except Exception:
-                pass
-            AUDIO_CHANGE_FILE.pop(uid, None)
+        
+        # NOTE: Do NOT clean up PENDING_AUDIO_ORDERS here. 
+        # Cleanup happens on successful reply or cancellation button press on the prompt message.
+        
         await m.reply_text("MKV অডিও পরিবর্তন মোড **অফ** করা হয়েছে।")
     else:
         MKV_AUDIO_CHANGE_MODE.add(uid)
@@ -674,7 +670,8 @@ async def mode_check_cmd(c, m: Message):
     audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
     caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
     
-    waiting_status_text = "একটি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if uid in AUDIO_CHANGE_FILE else "কোনো ফাইল অপেক্ষা করছে না।"
+    waiting_count = sum(1 for data in PENDING_AUDIO_ORDERS.values() if data['uid'] == uid)
+    waiting_status_text = f"{waiting_count}টি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if waiting_count > 0 else "কোনো ফাইল অপেক্ষা করছে না।"
     
     status_text = (
         "🤖 **বর্তমান মোড স্ট্যাটাস:**\n\n"
@@ -700,16 +697,8 @@ async def mode_toggle_callback(c: Client, cb: CallbackQuery):
     
     if action == "toggle_audio_mode":
         if uid in MKV_AUDIO_CHANGE_MODE:
-            # Turning OFF: Clear mode and cleanup pending file
+            # Turning OFF: Clear mode
             MKV_AUDIO_CHANGE_MODE.discard(uid)
-            if uid in AUDIO_CHANGE_FILE:
-                try:
-                    Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
-                    if 'message_id' in AUDIO_CHANGE_FILE[uid]:
-                        await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
-                except Exception:
-                    pass
-                AUDIO_CHANGE_FILE.pop(uid, None)
             message = "MKV Audio Change Mode OFF."
         else:
             # Turning ON
@@ -729,7 +718,8 @@ async def mode_toggle_callback(c: Client, cb: CallbackQuery):
         audio_status = "✅ ON" if uid in MKV_AUDIO_CHANGE_MODE else "❌ OFF"
         caption_status = "✅ ON" if uid in EDIT_CAPTION_MODE else "❌ OFF"
         
-        waiting_status_text = "একটি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if uid in AUDIO_CHANGE_FILE else "কোনো ফাইল অপেক্ষা করছে না।"
+        waiting_count = sum(1 for data in PENDING_AUDIO_ORDERS.values() if data['uid'] == uid)
+        waiting_status_text = f"{waiting_count}টি ফাইল ট্র্যাক অর্ডারের জন্য অপেক্ষা করছে।" if waiting_count > 0 else "কোনো ফাইল অপেক্ষা করছে না।"
 
         status_text = (
             "🤖 **বর্তমান মোড স্ট্যাটাস:**\n\n"
@@ -763,13 +753,15 @@ async def text_handler(c, m: Message):
         await m.reply_text("আপনার ক্যাপশন সেভ হয়েছে। এখন থেকে আপলোড করা ভিডিওতে এই ক্যাপশন ব্যবহার হবে।")
         return
 
-    # --- Handle audio order input if in mode and file is set ---
-    if uid in MKV_AUDIO_CHANGE_MODE and uid in AUDIO_CHANGE_FILE:
-        file_data = AUDIO_CHANGE_FILE.get(uid)
-        if not file_data or not file_data.get('tracks'):
-            await m.reply_text("অডিও ট্র্যাকের তথ্য পাওয়া যায়নি। প্রক্রিয়া বাতিল করা হচ্ছে।")
-            AUDIO_CHANGE_FILE.pop(uid, None)
-            return
+    # --- Handle audio order input if replying to an audio track list prompt (MODIFIED) ---
+    if m.reply_to_message and m.reply_to_message.id in PENDING_AUDIO_ORDERS:
+        prompt_message_id = m.reply_to_message.id
+        file_data = PENDING_AUDIO_ORDERS.get(prompt_message_id)
+        
+        # Security check: ensure the user is the one who initiated the process
+        if file_data['uid'] != uid:
+             await m.reply_text("আপনি এই ফাইলের জন্য অর্ডার দিতে পারবেন না।")
+             return
 
         tracks = file_data['tracks']
         try:
@@ -809,29 +801,31 @@ async def text_handler(c, m: Message):
                 stream_index_to_map = tracks[user_track_num - 1]['stream_index']
                 new_stream_map.append(f"0:{stream_index_to_map}") 
 
-            track_list_message_id = file_data.get('message_id')
-
             # Start the audio remux process
             asyncio.create_task(
                 handle_audio_remux(
                     c, m, file_data['path'], 
                     file_data['original_name'], 
                     new_stream_map, 
-                    messages_to_delete=[track_list_message_id, m.id]
+                    messages_to_delete=[prompt_message_id, m.id]
                 )
             )
 
             # Clear state immediately
-            AUDIO_CHANGE_FILE.pop(uid, None) # Clear only the waiting file state
+            PENDING_AUDIO_ORDERS.pop(prompt_message_id, None) 
             return
 
         except ValueError:
-            await m.reply_text("ভুল ফরম্যাট। কমা-সেপারেটেড সংখ্যা দিন। উদাহরণ: `3,2,1`")
+            await m.reply_to_message.reply_text("ভুল ফরম্যাট। কমা-সেপারেটেড সংখ্যা দিন। উদাহরণ: `3,2,1`")
             return
         except Exception as e:
             logger.error(f"Audio remux preparation error: {e}")
-            await m.reply_text(f"অডিও পরিবর্তন প্রক্রিয়া শুরু করতে সমস্যা: {e}")
-            AUDIO_CHANGE_FILE.pop(uid, None)
+            await m.reply_to_message.reply_text(f"অডিও পরিবর্তন প্রক্রিয়া শুরু করতে সমস্যা: {e}")
+            
+            # Clean up files before clearing state
+            try: Path(file_data['path']).unlink(missing_ok=True)
+            except Exception: pass
+            PENDING_AUDIO_ORDERS.pop(prompt_message_id, None)
             return
     # -----------------------------------------------------
 
@@ -1176,7 +1170,7 @@ async def forwarded_file_or_direct_file(c: Client, m: Message):
         # A direct video/document which isn't handled by another mode. Pass.
         pass
 
-# --- HANDLER FUNCTION: Handle file in audio change mode ---
+# --- HANDLER FUNCTION: Handle file in audio change mode (MODIFIED) ---
 async def handle_audio_change_file(c: Client, m: Message):
     uid = m.from_user.id
     file_info = m.video or m.document
@@ -1184,16 +1178,8 @@ async def handle_audio_change_file(c: Client, m: Message):
     if not file_info:
         await m.reply_text("এটি একটি ভিডিও ফাইল নয়।")
         return
-
-    # If there's already a file waiting for audio order, cancel the previous one
-    if uid in AUDIO_CHANGE_FILE:
-        try:
-            Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
-            if 'message_id' in AUDIO_CHANGE_FILE[uid]:
-                await c.delete_messages(m.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
-        except Exception:
-            pass
-        AUDIO_CHANGE_FILE.pop(uid, None)
+    
+    # Do NOT check for or clean up previous pending orders. Multiple are allowed now.
     
     # Download the file
     cancel_event = asyncio.Event()
@@ -1238,8 +1224,6 @@ async def handle_audio_change_file(c: Client, m: Message):
                 )
             )
             
-            # We don't set AUDIO_CHANGE_FILE, so the function ends here.
-            # tmp_path will be deleted by handle_audio_remux
             return 
         # --- END MODIFIED ---
 
@@ -1249,8 +1233,8 @@ async def handle_audio_change_file(c: Client, m: Message):
             track_list_text += f"{i}. **Stream Index:** {track['stream_index']}, **Language:** {track['language']}, **Title:** {track['title']}\n"
             
         track_list_text += (
-            "\nএখন আপনি কোন অডিও ট্র্যাকটি প্রথমে (primary) চান, সেই অনুযায়ী ট্র্যাক নম্বর (উপরে ১, ২, ৩...) কমা-সেপারেটেড সংখ্যায় দিন।\n"
-            "যেমন, যদি আপনি ৩য় ট্র্যাকটি প্রথমে, ২য়টি দ্বিতীয় এবং ১মটি তৃতীয়তে চান, তাহলে লিখুন: `3,2,1`\n"
+            "\n**অডিও অর্ডার দিতে এই মেসেজটিতে রিপ্লাই করে** কমা-সেপারেটেড সংখ্যায় আপনার ট্র্যাক নম্বরগুলো দিন।\n"
+            "যেমন, যদি আপনি ৩য় ট্র্যাকটি প্রথমে, ২য়টি দ্বিতীয় এবং ১মটি তৃতীয়তে চান, তাহলে রিপ্লাই করুন: `3,2,1`\n"
         )
         
         # --- MODIFIED: Add info about track deletion for 5+ tracks ---
@@ -1265,17 +1249,18 @@ async def handle_audio_change_file(c: Client, m: Message):
         # --- END MODIFIED ---
             
         track_list_text += (
-            "আপনি যদি অডিও পরিবর্তন না করতে চান, তাহলে `/mkv_video_audio_change` লিখে মোড অফ করুন।"
+            "\nঅডিও পরিবর্তন না করতে চাইলে, এই মেসেজের `Cancel` বাটনটি ব্যবহার করুন অথবা `/mkv_video_audio_change` লিখে মোড অফ করুন।"
         )
         
-        await status_msg.edit(track_list_text) 
+        # Edit the status message to be the prompt
+        await status_msg.edit(track_list_text, reply_markup=progress_keyboard()) 
         
-        # Store file info for the next text message handler
-        AUDIO_CHANGE_FILE[uid] = {
+        # Store file info using the prompt message ID as the key
+        PENDING_AUDIO_ORDERS[status_msg.id] = {
+            'uid': uid,
             'path': tmp_path, 
             'original_name': original_name,
-            'tracks': audio_tracks,
-            'message_id': status_msg.id
+            'tracks': audio_tracks
         }
         
     except Exception as e:
@@ -1303,7 +1288,7 @@ async def handle_audio_remux(c: Client, m: Message, in_path: Path, original_name
     out_name = generate_new_filename(original_name)
     # Ensure the output is an MKV file after remuxing
     if not out_name.lower().endswith(".mkv"):
-        out_name = out_name.split(".")[0] + ".mkv"
+        out_name = Path(out_name).stem + ".mkv"
     # ------------------------------------------------------------------
     out_path = TMP / f"remux_{uid}_{int(datetime.now().timestamp())}_{out_name}"
     
@@ -1416,6 +1401,33 @@ async def rename_cmd(c, m: Message):
 @app.on_callback_query(filters.regex("cancel_task"))
 async def cancel_task_cb(c, cb):
     uid = cb.from_user.id
+    # Get the ID of the message that contained the button
+    prompt_message_id = cb.message.id
+
+    # Check if this message ID is a pending audio order prompt
+    if prompt_message_id in PENDING_AUDIO_ORDERS:
+        file_data = PENDING_AUDIO_ORDERS.pop(prompt_message_id)
+        # Check if the user is the one who initiated the task
+        if file_data['uid'] == uid:
+            # Clean up the file
+            try:
+                Path(file_data['path']).unlink(missing_ok=True)
+            except Exception:
+                pass
+            
+            # Cancel associated download tasks (if any were running just before the prompt)
+            for ev in list(TASKS.get(uid, [])):
+                try: ev.set()
+                except: pass
+
+            await cb.answer("অডিও পরিবর্তন প্রক্রিয়া বাতিল করা হয়েছে।", show_alert=True)
+            try:
+                await cb.message.delete()
+            except Exception:
+                pass
+            return
+    
+    # If not a pending audio order, check general tasks (mostly for URL/rename downloads)
     if uid in TASKS and TASKS[uid]:
         for ev in list(TASKS[uid]):
             try:
@@ -1423,21 +1435,6 @@ async def cancel_task_cb(c, cb):
             except:
                 pass
         
-        # New: Clean up audio change state if in progress
-        if uid in MKV_AUDIO_CHANGE_MODE:
-            # We don't clear the mode, but clear the waiting file state if it exists
-            if uid in AUDIO_CHANGE_FILE:
-                if 'message_id' in AUDIO_CHANGE_FILE[uid]:
-                    try:
-                        await c.delete_messages(cb.message.chat.id, AUDIO_CHANGE_FILE[uid]['message_id'])
-                    except Exception:
-                        pass
-                try:
-                    Path(AUDIO_CHANGE_FILE[uid]['path']).unlink(missing_ok=True)
-                except Exception:
-                    pass
-                AUDIO_CHANGE_FILE.pop(uid, None)
-            
         await cb.answer("অপারেশন বাতিল করা হয়েছে।", show_alert=True)
         try:
             await cb.message.delete()
@@ -1649,7 +1646,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
                 try:
                     status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
                 except Exception:
-                    status_msg = await m.reply_text(f"ভিডিওটি {in_auto.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
+                    status_msg = await m.reply_text(f"ভিডিওটি {in_path.suffix} ফরম্যাটে আছে। MKV এ কনভার্ট করা হচ্ছে...", reply_markup=progress_keyboard())
                 if messages_to_delete:
                     messages_to_delete.append(status_msg.id)
                 else:
