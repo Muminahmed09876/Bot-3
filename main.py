@@ -1050,7 +1050,6 @@ async def handle_caption_only_upload(c: Client, m: Message):
         # Note: Editing caption of forwarded message only works if the bot is admin in both chats and has permission, 
         # but the primary use here is to upload it again with a new caption if forwarding is not working.
         
-        # Assuming the goal is to re-upload with the new caption, keeping file info same:
         if file_info.file_name:
             original_name = file_info.file_name
         elif m.video:
@@ -1881,9 +1880,19 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Bot stopped by user.")
     except Exception as e:
+        # এখানে ত্রুটিটি ধরা পড়ে এবং print হয়: "An error occurred: An asyncio.Future, a coroutine or an awaitable is required"
         print(f"An error occurred: {e}")
     finally:
-        if app.is_connected:
+        # --- FIX: TypeError: An asyncio.Future, a coroutine or an awaitable is required ---
+        # app.stop() কে একটি try/except ব্লক-এ রাখা হলো। যদি app.stop() কোনো coroutine না ফিরিয়ে
+        # None ফেরত দেয় (যা ক্লায়েন্ট ইতিমধ্যে বন্ধ হলে হতে পারে), তবে TypeError টি ধরা হবে এবং উপেক্ষা করা হবে।
+        try:
             loop.run_until_complete(app.stop())
+        except TypeError:
+            # Pyrogram client was already stopped or in an invalid state.
+            pass
+        except Exception as e:
+            # অন্য কোনো ত্রুটি হলে তা print করা হবে।
+            print(f"Error while attempting to stop Pyrogram client: {e}")
+        # --- END FIX ---
         print("Bot has stopped.")
-# --------------------------------------------
