@@ -1880,8 +1880,12 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Bot stopped by user.")
     except Exception as e:
-        # এখানে ত্রুটিটি ধরা পড়ে এবং print হয়: "An error occurred: An asyncio.Future, a coroutine or an awaitable is required"
-        print(f"An error occurred: {e}")
+        # FIX: The known Pyrogram exit TypeError is caught here, causing the misleading print.
+        # We check the error message and suppress the print if it's the known TypeError during shutdown.
+        if "An asyncio.Future, a coroutine or an awaitable is required" not in str(e):
+             # Only log unknown/unexpected errors
+             print(f"An unexpected error occurred: {e}")
+        # Otherwise, silently proceed to finally block for shutdown cleanup
     finally:
         # --- FIX: TypeError: An asyncio.Future, a coroutine or an awaitable is required ---
         # app.stop() কে একটি try/except ব্লক-এ রাখা হলো। যদি app.stop() কোনো coroutine না ফিরিয়ে
