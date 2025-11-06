@@ -109,7 +109,7 @@ def generate_new_filename(original_name: str) -> str:
         
     return BASE_NEW_NAME + file_ext
 
-# --- *** এই ফাংশনটি আপগ্রেড করা হয়েছে *** ---
+# --- *** এই ফাংশনটি আপগ্রেড করা হয়েছে (Duration Fix) *** ---
 def get_video_metadata(file_path: Path) -> dict:
     """Extracts duration, width, and height using FFprobe (with Hachoir fallback)."""
     data = {'duration': 0, 'width': 0, 'height': 0}
@@ -120,6 +120,7 @@ def get_video_metadata(file_path: Path) -> dict:
             "-v", "quiet",
             "-print_format", "json",
             "-show_streams",
+            "-show_format", # <-- ফরম্যাট তথ্যও আনতে বলা হলো
             str(file_path)
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
@@ -134,14 +135,22 @@ def get_video_metadata(file_path: Path) -> dict:
         if video_stream:
             data['width'] = int(video_stream.get('width', 0))
             data['height'] = int(video_stream.get('height', 0))
-            
-            # Try to get duration from video stream first, then from format
+        
+        # --- *** Duration লজিক সংশোধন করা হয়েছে *** ---
+        # প্রথমে format থেকে duration খোঁজা হবে (সবচেয়ে নির্ভরযোগ্য)
+        duration_str = metadata.get('format', {}).get('duration')
+        
+        # যদি format-এ না পাওয়া যায়, তবে video stream থেকে খোঁজা হবে
+        if not duration_str and video_stream:
             duration_str = video_stream.get('duration')
-            if not duration_str:
-                duration_str = metadata.get('format', {}).get('duration')
-                
-            if duration_str:
+            
+        if duration_str:
+            try:
                 data['duration'] = int(float(duration_str))
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse duration string: {duration_str}")
+                data['duration'] = 0 # পার্স করতে না পারলে 0 সেট হবে
+        # --- *** Duration লজিক সংশোধন শেষ *** ---
         
         # If ffprobe returns 0 (e.g., for some images/non-video), hachoir might catch it
         if data['width'] == 0 or data['height'] == 0:
@@ -159,11 +168,12 @@ def get_video_metadata(file_path: Path) -> dict:
             if not h_metadata:
                 return data # Return default data
             
-            if h_metadata.has("duration"):
+            # Hachoir থেকে duration, width, height পাওয়ার চেষ্টা
+            if h_metadata.has("duration") and data['duration'] == 0:
                 data['duration'] = int(h_metadata.get("duration").total_seconds())
-            if h_metadata.has("width"):
+            if h_metadata.has("width") and data['width'] == 0:
                 data['width'] = int(h_metadata.get("width"))
-            if h_metadata.has("height"):
+            if h_metadata.has("height") and data['height'] == 0:
                 data['height'] = int(h_metadata.get("height"))
             logger.info(f"Hachoir fallback successful for {file_path}")
         except Exception as he:
