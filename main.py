@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", "5000"))
+PORT = int(os.getenv("PORT", "10000")) # <-- Render.com এর জন্য 10000 পোর্টে পরিবর্তন করা হলো
 # New env var from previous code
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME") 
 
@@ -109,29 +109,68 @@ def generate_new_filename(original_name: str) -> str:
         
     return BASE_NEW_NAME + file_ext
 
+# --- *** এই ফাংশনটি আপগ্রেড করা হয়েছে *** ---
 def get_video_metadata(file_path: Path) -> dict:
-    """Extracts duration, width, and height using Hachoir."""
+    """Extracts duration, width, and height using FFprobe (with Hachoir fallback)."""
     data = {'duration': 0, 'width': 0, 'height': 0}
     try:
-        parser = createParser(str(file_path))
-        if not parser:
-            return data
-        with parser:
-            metadata = extractMetadata(parser)
-        if not metadata:
-            return data
+        # 1. FFprobe (Primary Method)
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            str(file_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+        metadata = json.loads(result.stdout)
         
-        if metadata.has("duration"):
-            data['duration'] = int(metadata.get("duration").total_seconds())
-        if metadata.has("width"):
-            data['width'] = int(metadata.get("width"))
-        if metadata.has("height"):
-            data['height'] = int(metadata.get("height"))
+        video_stream = None
+        for stream in metadata.get('streams', []):
+            if stream.get('codec_type') == 'video':
+                video_stream = stream
+                break
+        
+        if video_stream:
+            data['width'] = int(video_stream.get('width', 0))
+            data['height'] = int(video_stream.get('height', 0))
+            
+            # Try to get duration from video stream first, then from format
+            duration_str = video_stream.get('duration')
+            if not duration_str:
+                duration_str = metadata.get('format', {}).get('duration')
+                
+            if duration_str:
+                data['duration'] = int(float(duration_str))
+        
+        # If ffprobe returns 0 (e.g., for some images/non-video), hachoir might catch it
+        if data['width'] == 0 or data['height'] == 0:
+            raise Exception("FFprobe returned 0 dimensions, trying Hachoir")
+
     except Exception as e:
-        logger.warning(f"Hachoir metadata extraction failed: {e}")
-        # Return whatever was found, or defaults
+        logger.warning(f"FFprobe metadata extraction failed: {e}. Trying Hachoir fallback...")
+        # 2. Hachoir (Fallback Method)
+        try:
+            parser = createParser(str(file_path))
+            if not parser:
+                return data # Return default data
+            with parser:
+                h_metadata = extractMetadata(parser)
+            if not h_metadata:
+                return data # Return default data
+            
+            if h_metadata.has("duration"):
+                data['duration'] = int(h_metadata.get("duration").total_seconds())
+            if h_metadata.has("width"):
+                data['width'] = int(h_metadata.get("width"))
+            if h_metadata.has("height"):
+                data['height'] = int(h_metadata.get("height"))
+            logger.info(f"Hachoir fallback successful for {file_path}")
+        except Exception as he:
+            logger.error(f"Hachoir fallback ALSO failed: {he}")
     
     return data
+# --- *** ফাংশন আপগ্রেড শেষ *** ---
 
 def parse_time(time_str: str) -> int:
     """Parses a time string like '5s', '1m', '1h 30s' into seconds."""
@@ -1714,7 +1753,7 @@ async def process_file_and_upload(c: Client, m: Message, in_path: Path, original
             TASKS[uid].remove(cancel_event)
             return
         
-        # --- সংশোধিত: মেটাডেটা সংগ্রহ ---
+        # --- সংশোধিত: মেটাডেটা সংগ্রহ (এই লাইনটি পরিবর্তন হয়নি, কারণ get_video_metadata ফাংশনটিই আপগ্রেড করা হয়েছে) ---
         video_metadata = get_video_metadata(upload_path) if (is_video and upload_path.exists()) else {'duration': 0, 'width': 0, 'height': 0}
         duration_sec = video_metadata.get('duration', 0)
         width_px = video_metadata.get('width', 0)
